@@ -1,0 +1,8 @@
+[gd_resource type="ShaderMaterial" load_steps=2 format=3 uid="uid://dvis5yqxdjnrg"]
+
+[ext_resource type="Shader" uid="uid://b4tdivdo6eo2b" path="res://addons/nexus_vertex_painter/shaders/vertex.gdshader" id="1_g40eg"]
+
+[resource]
+render_priority = 0
+shader = ExtResource("1_g40eg")
+shader_parameter/uv_scale = 10.0
