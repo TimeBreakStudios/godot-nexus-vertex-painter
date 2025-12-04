@@ -25,4 +25,6 @@ Designed to feel close to Unreal Engine's mesh painting workflow.
 
 Join the Discord server to ask questions, suggest features, or show off your projects made with this addon!
 
-[<img src="https://assets-global.website-files.com/6257adef93867e56f84d3092/636e0a6a49cf127bf92de1e2_icon_clyde_blurple_RGB.png" width="20"/> **Join the Discord Community**]([DEIN_EINLADUNGS_LINK](https://discord.gg/HMxbzqWCgQ))
+<a href= https://discord.gg/HMxbzqWCgQ>
+  <img src="https://img.shields.io/badge/Join-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join Discord">
+</a>
