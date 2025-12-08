@@ -26,6 +26,7 @@ signal procedural_requested(type, settings)
 # Tools / Modes
 @onready var btn_add: Button = %Add_Button
 @onready var btn_sub: Button = %Substract_Button
+@onready var btn_set: Button = %Set_Button
 @onready var btn_fill: Button = %Fill_Button
 @onready var btn_clear: Button = %Clear_Button
 
@@ -36,7 +37,7 @@ signal procedural_requested(type, settings)
 @onready var btn_proc_noise: Button = %Proc_Noise_Btn
 
 # Internal State
-var _brush_mode: int = 0 # 0 = Add, 1 = Subtract
+var _brush_mode: int = 0 # 0 = Add, 1 = Subtract, 2 = Set
 
 
 func _ready() -> void:
@@ -57,12 +58,16 @@ func _ready() -> void:
 	# 3. Setup Paint Modes
 	btn_add.toggle_mode = true
 	btn_sub.toggle_mode = true
+	btn_set.toggle_mode = true
+	
 	btn_add.button_pressed = true
 	
 	if not btn_add.pressed.is_connected(_on_mode_add_pressed):
 		btn_add.pressed.connect(_on_mode_add_pressed)
 	if not btn_sub.pressed.is_connected(_on_mode_sub_pressed):
 		btn_sub.pressed.connect(_on_mode_sub_pressed)
+	if not btn_set.pressed.is_connected(_on_mode_set_pressed):
+		btn_set.pressed.connect(_on_mode_set_pressed)
 	
 	# 4. Setup Action Buttons
 	if not btn_fill.pressed.is_connected(_on_fill_pressed):
@@ -104,6 +109,18 @@ func get_settings() -> Dictionary:
 		"mode": _brush_mode
 	}
 
+# --- API FOR MOUSE SHORTCUTS ---
+
+func set_brush_size(value: float):
+	# Setting .value triggers the 'value_changed' signal automatically,
+	# which updates the rest of the plugin logic.
+	size_slider.value = value
+
+func set_brush_strength(value: float):
+	strength_slider.value = value
+
+func set_brush_falloff(value: float):
+	falloff_slider.value = value
 
 func get_active_channels() -> Vector4:
 	return Vector4(
@@ -164,6 +181,7 @@ func _update_all_button_visuals():
 	
 	_apply_active_style(btn_add, bg_accent, accent)
 	_apply_active_style(btn_sub, bg_accent, accent)
+	_apply_active_style(btn_set, bg_accent, accent)
 
 func _apply_active_style(btn: Button, bg_color: Color, border_color: Color):
 	if btn.button_pressed:
@@ -199,6 +217,7 @@ func _on_mode_add_pressed() -> void:
 	_brush_mode = 0
 	btn_add.button_pressed = true
 	btn_sub.button_pressed = false
+	btn_set.button_pressed = false
 	_update_all_button_visuals()
 	emit_signal("settings_changed")
 
@@ -206,6 +225,15 @@ func _on_mode_sub_pressed() -> void:
 	_brush_mode = 1
 	btn_sub.button_pressed = true
 	btn_add.button_pressed = false
+	btn_set.button_pressed = false
+	_update_all_button_visuals()
+	emit_signal("settings_changed")
+
+func _on_mode_set_pressed() -> void:
+	_brush_mode = 2
+	btn_set.button_pressed = true
+	btn_add.button_pressed = false
+	btn_sub.button_pressed = false
 	_update_all_button_visuals()
 	emit_signal("settings_changed")
 
@@ -230,9 +258,11 @@ func _on_proc_noise_pressed():
 # --- SHORTCUT HANDLERS ---
 
 func toggle_add_subtract():
-	# Toggle between 0 (Add) and 1 (Subtract)
+	# Cycle: Add -> Sub -> Set -> Add
 	if _brush_mode == 0:
 		_on_mode_sub_pressed()
+	elif _brush_mode == 1:
+		_on_mode_set_pressed()
 	else:
 		_on_mode_add_pressed()
 
