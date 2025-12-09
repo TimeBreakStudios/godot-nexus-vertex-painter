@@ -3,37 +3,44 @@ render_mode unshaded, depth_draw_never, cull_back, blend_mix;
 
 uniform sampler2D depth_texture : hint_depth_texture, filter_linear_mipmap;
 
-uniform vec4 channel_mask = vec4(1.0, 0.0, 0.0, 0.0); 
+// --- TEXTURE SETTINGS ---
+uniform sampler2D brush_texture : source_color, filter_linear_mipmap, repeat_disable;
+uniform bool use_texture = false;
 
+uniform vec4 channel_mask = vec4(1.0, 0.0, 0.0, 0.0); 
 uniform float brush_radius = 1.0; 
 uniform float falloff_range : hint_range(0.0, 1.0) = 0.5;
 uniform float brush_strength : hint_range(0.0, 1.0) = 1.0;
 uniform vec3 brush_pos; 
 
-// Line settings
+// Visual settings
 uniform float width_outer = 0.008; 
 uniform float width_inner = 0.002; 
 uniform float softness = 0.002;
 uniform float thickness_scale = 0.015;
 uniform float min_thickness = 0.002;
 
+// Varyings
 varying vec3 world_pos;
+varying vec3 v_normal; 
 
 void vertex() {
 	// Physical Overlay
 	VERTEX += NORMAL * 0.005;
 	world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	// Normal for Triplanar Blending
+	v_normal = normalize((MODEL_MATRIX * vec4(NORMAL, 0.0)).xyz);
 }
 
 void fragment() {
 	float dist = distance(world_pos, brush_pos);
 	
-	// --- DYNAMIC WIDTHS ---
+	// Dynamic Widths
 	float w_outer = max(min_thickness, brush_radius * thickness_scale);
 	float w_inner = max(min_thickness * 0.5, w_outer * 0.25);
 	float dyn_softness = w_outer * 0.5;
 	
-	// --- COLOR LOGIC ---
+	// Color Logic
 	vec3 final_color = vec3(0.0);
 	if (channel_mask.r > 0.5) final_color.r += 1.0;
 	if (channel_mask.g > 0.5) final_color.g += 1.0;
@@ -42,83 +49,112 @@ void fragment() {
 	if (length(final_color) < 0.1) final_color = vec3(0.5); 
 	final_color = normalize(final_color + vec3(0.001));
 	
-	// --- RING LOGIC ---
-	float alpha = 0.0;
+	// --- TRIPLANAR TEXTURE LOGIC ---
+	float tex_alpha = 0.0;
 	
-	// 1. Main Brush Ring
+	if (use_texture) {
+		// 1. Triplanar Weights
+		vec3 blending = abs(v_normal);
+		blending = pow(blending, vec3(4.0)); // Sharp blending
+		blending /= dot(blending, vec3(1.0));
+		
+		// 2. Relative Position
+		vec3 rel_pos = world_pos - brush_pos;
+		float uv_scale = 1.0 / (brush_radius * 2.0);
+		
+		// 3. Calculate Projections
+		
+		// Top/Bottom (XZ Plane)
+		vec2 uv_y = rel_pos.xz * uv_scale + 0.5;
+		uv_y.y = 1.0 - uv_y.y; // Flip Y (Standard)
+		uv_y.x = 1.0 - uv_y.x; // FIX: Correct Horizontal Mirroring
+		
+		// Front/Back (XY Plane)
+		vec2 uv_z = rel_pos.xy * uv_scale + 0.5;
+		uv_z.y = 1.0 - uv_z.y; 
+		uv_z.x = 1.0 - uv_z.x; // FIX: Correct Horizontal Mirroring
+		
+		// Left/Right (ZY Plane)
+		vec2 uv_x = rel_pos.zy * uv_scale + 0.5;
+		uv_x.y = 1.0 - uv_x.y;
+		uv_x.x = 1.0 - uv_x.x; // FIX: Correct Horizontal Mirroring
+		
+		// 4. Sampling with bounds check
+		float col_y = 0.0;
+		if(uv_y.x >= 0.0 && uv_y.x <= 1.0 && uv_y.y >= 0.0 && uv_y.y <= 1.0) {
+			vec4 s = texture(brush_texture, uv_y);
+			col_y = s.r * s.a;
+		}
+		
+		float col_z = 0.0;
+		if(uv_z.x >= 0.0 && uv_z.x <= 1.0 && uv_z.y >= 0.0 && uv_z.y <= 1.0) {
+			vec4 s = texture(brush_texture, uv_z);
+			col_z = s.r * s.a;
+		}
+		
+		float col_x = 0.0;
+		if(uv_x.x >= 0.0 && uv_x.x <= 1.0 && uv_x.y >= 0.0 && uv_x.y <= 1.0) {
+			vec4 s = texture(brush_texture, uv_x);
+			col_x = s.r * s.a;
+		}
+		
+		// 5. Blending
+		tex_alpha = col_x * blending.x + col_y * blending.y + col_z * blending.z;
+		
+		// Soft circular crop
+		float circle_mask = 1.0 - smoothstep(brush_radius - 0.05, brush_radius, dist);
+		tex_alpha *= circle_mask;
+	}
+	
+	// --- RING LOGIC ---
+	
 	float dist_delta_outer = abs(dist - brush_radius);
 	float outer_ring = 1.0 - smoothstep(w_outer, w_outer + dyn_softness, dist_delta_outer);
 	
-	// 2. Falloff Ring
-	float inner_radius_val = brush_radius * (1.0 - falloff_range);
-	float dist_delta_inner = abs(dist - inner_radius_val);
-	float inner_ring = 1.0 - smoothstep(w_inner, w_inner + dyn_softness, dist_delta_inner);
+	float inner_ring = 0.0;
+	if (!use_texture) {
+		float inner_r = brush_radius * (1.0 - falloff_range);
+		float dist_delta_inner = abs(dist - inner_r);
+		inner_ring = 1.0 - smoothstep(w_inner, w_inner + dyn_softness, dist_delta_inner);
+	}
 	
-	// 3. STRENGTH ARC METER (NEW)
-	// Place it slightly outside the main ring (with some padding)
+	// Meter
 	float meter_radius = brush_radius + w_outer + (brush_radius * 0.05) + 0.02;
-	float dist_delta_meter = abs(dist - meter_radius);
-	
-	// Base track (faint)
-	float meter_track_alpha = 1.0 - smoothstep(w_inner, w_inner + dyn_softness, dist_delta_meter);
-	
-	// Calculate Angle for the Fill
+	float meter_track = 1.0 - smoothstep(w_inner, w_inner + dyn_softness, abs(dist - meter_radius));
 	vec3 dir = world_pos - brush_pos;
-	// atan(x, z) gives an angle around the Y axis (Terrain/Floor projection)
 	float angle = atan(dir.x, dir.z); 
-	// Normalize angle from -PI..PI to 0..1
-	float meter_percent = (angle / 3.14159) * 0.5 + 0.5;
+	float meter_pct = (angle / 3.14159) * 0.5 + 0.5;
+	float meter_fill = (meter_pct < brush_strength) ? meter_track : 0.0;
 	
-	// Fill logic
-	float meter_fill_alpha = 0.0;
-	if (meter_percent < brush_strength) {
-		meter_fill_alpha = meter_track_alpha;
+	// --- COMPOSITION ---
+	
+	float final_alpha = 0.0;
+	vec3 final_rgb = final_color;
+	
+	if (use_texture) {
+		if (tex_alpha > 0.0) final_alpha = tex_alpha; 
 	}
 	
-	// --- ASSEMBLY ---
+	if (outer_ring > final_alpha) final_alpha = outer_ring;
 	
-	vec3 out_rgb = vec3(0.0);
-	float combined_alpha = 0.0;
-	
-	// Layer 1: Main Ring
-	if (outer_ring > 0.0) {
-		out_rgb = final_color;
-		combined_alpha = outer_ring;
+	if (inner_ring > final_alpha) {
+		final_alpha = inner_ring;
+		if (channel_mask.a > 0.5) final_rgb = vec3(1.0);
 	}
 	
-	// Layer 2: Falloff Ring (Inner) - White if Alpha Mode
-	vec3 inner_col = final_color;
-	if (channel_mask.a > 0.5) inner_col = vec3(1.0);
-	
-	if (inner_ring > 0.0) {
-		out_rgb = inner_col;
-		combined_alpha = max(combined_alpha, inner_ring);
-	}
-	
-	// Layer 3: Strength Meter (Outer)
-	if (meter_track_alpha > 0.0) {
-		// Draw Track (Faint)
-		float track_vis = meter_track_alpha * 0.3; // 30% opacity for track
-		// Draw Fill (Solid)
-		float fill_vis = meter_fill_alpha; 
-		
-		float meter_final = max(track_vis, fill_vis);
-		
-		// If we are over existing rings, blend? 
-		// Actually just taking the max is fine for a UI overlay feel.
-		if (meter_final > combined_alpha) {
-			combined_alpha = meter_final;
-			out_rgb = final_color; // Use channel color for the meter too
+	if (meter_track > 0.0) {
+		float m_vis = max(meter_track * 0.2, meter_fill);
+		if (m_vis > final_alpha) {
+			final_alpha = m_vis;
+			final_rgb = final_color;
 		}
 	}
 
-	// Clipping
-	// Increase cull radius to include the new meter ring
 	if (dist > meter_radius + w_outer + 0.1) {
-		combined_alpha = 0.0;
+		final_alpha = 0.0;
 		discard;
 	}
 
-	ALBEDO = out_rgb;
-	ALPHA = combined_alpha; 
+	ALBEDO = final_rgb;
+	ALPHA = final_alpha;
 }

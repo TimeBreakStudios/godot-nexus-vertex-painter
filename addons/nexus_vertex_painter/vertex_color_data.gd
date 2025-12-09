@@ -17,6 +17,33 @@ func _ready():
 func _enter_tree():
 	call_deferred("_apply_colors")
 
+# --- NEW: IMPORT LOGIC ---
+
+func initialize_from_mesh():
+	# This function is called once when the node is created.
+	# It checks if the parent mesh already has vertex colors (e.g. from a bake)
+	# and imports them into our storage so we don't start with black.
+	var parent = get_parent() as MeshInstance3D
+	if not parent or not parent.mesh: return
+	
+	var mesh = parent.mesh
+	
+	# Iterate over all surfaces to find existing colors
+	for i in range(mesh.get_surface_count()):
+		var arrays = mesh.surface_get_arrays(i)
+		
+		# Check if Color Array exists and has data
+		if arrays[Mesh.ARRAY_COLOR] != null and arrays[Mesh.ARRAY_COLOR].size() > 0:
+			var colors = arrays[Mesh.ARRAY_COLOR]
+			
+			# Ensure it is a PackedColorArray (conversion if necessary)
+			if colors is PackedColorArray:
+				surface_data[i] = colors
+			elif colors is PackedByteArray:
+				# Convert Byte Colors to Color Array if needed (rare case for runtime meshes)
+				# usually surface_get_arrays returns Objects/Floats, so PackedColorArray is expected.
+				pass 
+
 # Public API to update a specific surface
 func update_surface_colors(surface_idx: int, new_colors: PackedColorArray):
 	surface_data[surface_idx] = new_colors
@@ -94,3 +121,15 @@ func _apply_colors():
 		# Safety check: Ensure the new mesh actually has this surface index
 		if idx < parent.get_surface_override_material_count():
 			parent.set_surface_override_material(idx, instance_overrides[idx])
+
+# --- UNDO / REDO API ---
+
+func get_data_snapshot() -> Dictionary:
+	var snapshot = {}
+	for surface_idx in surface_data:
+		snapshot[surface_idx] = surface_data[surface_idx].duplicate()
+	return snapshot
+
+func apply_data_snapshot(snapshot: Dictionary):
+	surface_data = snapshot.duplicate(true)
+	_apply_colors()
