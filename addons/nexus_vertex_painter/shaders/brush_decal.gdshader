@@ -13,6 +13,12 @@ uniform float falloff_range : hint_range(0.0, 1.0) = 0.5;
 uniform float brush_strength : hint_range(0.0, 1.0) = 1.0;
 uniform vec3 brush_pos; 
 
+// Rotation angle in radians
+uniform float brush_angle = 0.0;
+
+// Pass the hit normal explicitly
+uniform vec3 brush_normal = vec3(0.0, 1.0, 0.0); 
+
 // Visual settings
 uniform float width_outer = 0.008; 
 uniform float width_inner = 0.002; 
@@ -32,6 +38,15 @@ void vertex() {
 	v_normal = normalize((MODEL_MATRIX * vec4(NORMAL, 0.0)).xyz);
 }
 
+// --- HELPER: ROTATE UV ---
+vec2 rotate_uv(vec2 uv, float angle) {
+	vec2 pivot = vec2(0.5);
+	float s = sin(angle);
+	float c = cos(angle);
+	mat2 rotation_mat = mat2(vec2(c, s), vec2(-s, c));
+	return pivot + rotation_mat * (uv - pivot);
+}
+
 void fragment() {
 	float dist = distance(world_pos, brush_pos);
 	
@@ -49,35 +64,54 @@ void fragment() {
 	if (length(final_color) < 0.1) final_color = vec3(0.5); 
 	final_color = normalize(final_color + vec3(0.001));
 	
-	// --- TRIPLANAR TEXTURE LOGIC ---
+	// --- TRIPLANAR TEXTURE LOGIC (FIXED MIRRORING) ---
 	float tex_alpha = 0.0;
 	
 	if (use_texture) {
 		// 1. Triplanar Weights
 		vec3 blending = abs(v_normal);
-		blending = pow(blending, vec3(4.0)); // Sharp blending
+		blending = pow(blending, vec3(4.0)); 
 		blending /= dot(blending, vec3(1.0));
 		
-		// 2. Relative Position
+		// 2. Relative Position (Centered at Brush)
 		vec3 rel_pos = world_pos - brush_pos;
 		float uv_scale = 1.0 / (brush_radius * 2.0);
 		
-		// 3. Calculate Projections
+		// 3. Calculate Projections & Apply Rotation & Fix Mirroring
 		
-		// Top/Bottom (XZ Plane)
-		vec2 uv_y = rel_pos.xz * uv_scale + 0.5;
-		uv_y.y = 1.0 - uv_y.y; // Flip Y (Standard)
-		uv_y.x = 1.0 - uv_y.x; // FIX: Correct Horizontal Mirroring
+		// --- Y-Plane (Top/Bottom) ---
+		// Map XZ to UV.
+		vec2 raw_uv_y = rel_pos.xz;
+		// FIX: If normal points down (-Y), flip X to prevent mirroring looking from below
+		if (v_normal.y < 0.0) raw_uv_y.x = -raw_uv_y.x;
+		// Standard Flip for Y-Projection usually requires inverting X relative to Z for readable text
+		raw_uv_y.x = -raw_uv_y.x; 
 		
-		// Front/Back (XY Plane)
-		vec2 uv_z = rel_pos.xy * uv_scale + 0.5;
+		vec2 uv_y = raw_uv_y * uv_scale + 0.5;
+		uv_y.y = 1.0 - uv_y.y; // Standard Vertical Flip
+		uv_y = rotate_uv(uv_y, brush_angle);
+
+		// --- Z-Plane (Front/Back) ---
+		// Map XY to UV.
+		vec2 raw_uv_z = rel_pos.xy;
+		// FIX: If normal points Back (-Z), flip X to prevent mirroring
+		if (v_normal.z < 0.0) raw_uv_z.x = -raw_uv_z.x;
+		
+		vec2 uv_z = raw_uv_z * uv_scale + 0.5;
 		uv_z.y = 1.0 - uv_z.y; 
-		uv_z.x = 1.0 - uv_z.x; // FIX: Correct Horizontal Mirroring
+		uv_z = rotate_uv(uv_z, brush_angle);
 		
-		// Left/Right (ZY Plane)
-		vec2 uv_x = rel_pos.zy * uv_scale + 0.5;
+		// --- X-Plane (Left/Right) ---
+		// Map ZY to UV.
+		vec2 raw_uv_x = rel_pos.zy;
+		// FIX: If normal points Left (-X), flip horizontal axis (Z in this case)
+		if (v_normal.x < 0.0) raw_uv_x.x = -raw_uv_x.x;
+		// Correction for side mapping direction
+		raw_uv_x.x = -raw_uv_x.x; 
+		
+		vec2 uv_x = raw_uv_x * uv_scale + 0.5;
 		uv_x.y = 1.0 - uv_x.y;
-		uv_x.x = 1.0 - uv_x.x; // FIX: Correct Horizontal Mirroring
+		uv_x = rotate_uv(uv_x, brush_angle);
 		
 		// 4. Sampling with bounds check
 		float col_y = 0.0;
@@ -106,7 +140,7 @@ void fragment() {
 		tex_alpha *= circle_mask;
 	}
 	
-	// --- RING LOGIC ---
+	// --- RING LOGIC (Unchanged) ---
 	
 	float dist_delta_outer = abs(dist - brush_radius);
 	float outer_ring = 1.0 - smoothstep(w_outer, w_outer + dyn_softness, dist_delta_outer);

@@ -2,49 +2,113 @@
 extends Node
 class_name VertexColorData
 
-# Storage for colors per surface.
+# --- STORAGE ---
 # Format: { surface_index (int) : colors (PackedColorArray) }
 @export var surface_data: Dictionary = {}
 
-# Runtime cache
+# --- RUNTIME CACHE ---
+# We cache positions and normals in RAM to avoid expensive PhysicsServer or Mesh queries
+# during the painting loop.
+var _cache_positions: Dictionary = {} # { surface_idx: PackedVector3Array }
+var _cache_normals: Dictionary = {}   # { surface_idx: PackedVector3Array }
+var _neighbor_cache: Dictionary = {}  # { surface_idx: { vertex_idx: [neighbor_idx, ...] } } (Used for Blur)
+
 var _runtime_mesh: ArrayMesh
 var _source_arrays_cache: Dictionary = {} # Maps surface_index -> Array
 var _source_materials_cache: Dictionary = {} # Maps surface_index -> Material
+
+const DATA_VERSION = 2
 
 func _ready():
 	request_ready()
 
 func _enter_tree():
+	# Security check: Ensure runtime caches are cleared when entering tree
+	# This prevents old state from interfering after a script reload
+	_cache_positions.clear()
+	_cache_normals.clear()
+	_neighbor_cache.clear()
+	
+	# Re-apply colors ensures the mesh is built correctly from the stored 'surface_data'
 	call_deferred("_apply_colors")
 
-# --- NEW: IMPORT LOGIC ---
+# --- INITIALIZATION ---
 
 func initialize_from_mesh():
-	# This function is called once when the node is created.
-	# It checks if the parent mesh already has vertex colors (e.g. from a bake)
-	# and imports them into our storage so we don't start with black.
+	# Called when the node is created. Imports existing colors (e.g., from a bake)
+	# so we don't start with a black mesh.
 	var parent = get_parent() as MeshInstance3D
 	if not parent or not parent.mesh: return
 	
 	var mesh = parent.mesh
+	_prep_cache(mesh) # Build cache immediately
 	
-	# Iterate over all surfaces to find existing colors
 	for i in range(mesh.get_surface_count()):
 		var arrays = mesh.surface_get_arrays(i)
 		
 		# Check if Color Array exists and has data
 		if arrays[Mesh.ARRAY_COLOR] != null and arrays[Mesh.ARRAY_COLOR].size() > 0:
-			var colors = arrays[Mesh.ARRAY_COLOR]
-			
-			# Ensure it is a PackedColorArray (conversion if necessary)
-			if colors is PackedColorArray:
-				surface_data[i] = colors
-			elif colors is PackedByteArray:
-				# Convert Byte Colors to Color Array if needed (rare case for runtime meshes)
-				# usually surface_get_arrays returns Objects/Floats, so PackedColorArray is expected.
-				pass 
+			surface_data[i] = arrays[Mesh.ARRAY_COLOR]
 
-# Public API to update a specific surface
+# --- CACHE MANAGEMENT ---
+
+func _prep_cache(mesh: Mesh):
+	_cache_positions.clear()
+	_cache_normals.clear()
+	
+	for i in range(mesh.get_surface_count()):
+		var arrays = mesh.surface_get_arrays(i)
+		_cache_positions[i] = arrays[Mesh.ARRAY_VERTEX]
+		
+		# Cache normals if available, otherwise store empty
+		if arrays[Mesh.ARRAY_NORMAL]:
+			_cache_normals[i] = arrays[Mesh.ARRAY_NORMAL]
+		else:
+			_cache_normals[i] = PackedVector3Array()
+
+# Public getters for the painter (High Performance)
+func get_positions(surf_idx: int) -> PackedVector3Array:
+	if not _cache_positions.has(surf_idx): return PackedVector3Array()
+	return _cache_positions[surf_idx]
+
+func get_normals(surf_idx: int) -> PackedVector3Array:
+	if not _cache_normals.has(surf_idx): return PackedVector3Array()
+	return _cache_normals[surf_idx]
+
+# --- NEIGHBOR CACHE (Lazy Loaded) ---
+# Finding neighbors is expensive (O(N)), so we only do it if the user selects the BLUR tool
+# and we only calculate it once per surface.
+func get_neighbors(surf_idx: int, vert_idx: int) -> Array:
+	if not _neighbor_cache.has(surf_idx):
+		_build_neighbor_cache(surf_idx)
+	
+	if _neighbor_cache[surf_idx].has(vert_idx):
+		return _neighbor_cache[surf_idx][vert_idx]
+	return []
+
+func _build_neighbor_cache(surf_idx: int):
+	var parent = get_parent() as MeshInstance3D
+	if not parent or not parent.mesh: return
+	
+	# We use MeshDataTool ONLY here for topology analysis
+	var mdt = MeshDataTool.new()
+	mdt.create_from_surface(parent.mesh, surf_idx)
+	
+	var surf_neighbors = {}
+	for v in range(mdt.get_vertex_count()):
+		var edges = mdt.get_vertex_edges(v)
+		var n_list = []
+		for e in edges:
+			var v1 = mdt.get_edge_vertex(e, 0)
+			var v2 = mdt.get_edge_vertex(e, 1)
+			# The neighbor is the vertex that isn't me
+			n_list.append(v2 if v1 == v else v1)
+		surf_neighbors[v] = n_list
+	
+	_neighbor_cache[surf_idx] = surf_neighbors
+
+# --- VISUAL UPDATE ---
+
 func update_surface_colors(surface_idx: int, new_colors: PackedColorArray):
 	surface_data[surface_idx] = new_colors
 	_apply_colors()
@@ -55,12 +119,12 @@ func _apply_colors():
 	
 	var current_mesh = parent.mesh
 	
-	# --- 1. INITIALIZATION & CACHING ---
+	# 1. Handle Mesh Switching / Init
 	if current_mesh != _runtime_mesh:
-		# If we have a valid mesh that isn't our runtime mesh yet, cache it.
 		if current_mesh and current_mesh.get_surface_count() > 0:
 			_source_arrays_cache.clear()
 			_source_materials_cache.clear()
+			_prep_cache(current_mesh) # Refresh cache if mesh changed
 			
 			for i in range(current_mesh.get_surface_count()):
 				_source_arrays_cache[i] = current_mesh.surface_get_arrays(i)
@@ -69,66 +133,56 @@ func _apply_colors():
 			if not _runtime_mesh:
 				_runtime_mesh = ArrayMesh.new()
 				_runtime_mesh.resource_name = current_mesh.resource_name
-			
-			# We will assign it later to ensure a clean state switch
-	
+
 	if _source_arrays_cache.is_empty(): return
 
-	# --- 2. RESCUE INSTANCE OVERRIDES ---
-	# Capture current overrides before we detach the mesh
+	# 2. Rescue Instance Overrides
 	var instance_overrides = {}
-	var override_count = parent.get_surface_override_material_count()
-	for idx in range(override_count):
+	for idx in range(parent.get_surface_override_material_count()):
 		var mat = parent.get_surface_override_material(idx)
-		if mat:
-			instance_overrides[idx] = mat
+		if mat: instance_overrides[idx] = mat
 
-	# --- 3. DETACH MESH (FIX) ---
-	# We temporarily remove the mesh from the instance.
-	# This prevents the MeshInstance from reacting to every single step of the rebuild (clearing/adding).
-	# It avoids the "Index out of bounds" error because we only re-assign the mesh when it's fully built.
+	# 3. Rebuild Runtime Mesh
+	# Detach momentarily to prevent instance updates during rebuild
 	parent.mesh = null
-
-	# --- 4. REBUILD MESH ---
 	_runtime_mesh.clear_surfaces()
 	
-	var surface_indices = _source_arrays_cache.keys()
-	surface_indices.sort()
+	var sorted_indices = _source_arrays_cache.keys()
+	sorted_indices.sort()
 	
-	for surf_idx in surface_indices:
+	for surf_idx in sorted_indices:
 		var arrays = _source_arrays_cache[surf_idx].duplicate(true)
 		var vertex_count = arrays[Mesh.ARRAY_VERTEX].size()
 		
+		# Inject Colors
 		if surface_data.has(surf_idx):
-			var stored_colors = surface_data[surf_idx] as PackedColorArray
-			if stored_colors.size() != vertex_count:
-				stored_colors.resize(vertex_count)
-				surface_data[surf_idx] = stored_colors
+			var c = surface_data[surf_idx]
+			if c.size() != vertex_count: c.resize(vertex_count)
+			arrays[Mesh.ARRAY_COLOR] = c
+		else:
+			# Fallback to black if no data yet
+			var c = PackedColorArray()
+			c.resize(vertex_count)
+			c.fill(Color.BLACK)
+			arrays[Mesh.ARRAY_COLOR] = c
 			
-			arrays[Mesh.ARRAY_COLOR] = stored_colors
-		
 		_runtime_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
 		
-		# Restore original resource material
-		if _source_materials_cache.has(surf_idx) and _source_materials_cache[surf_idx] != null:
+		# Restore Material
+		if _source_materials_cache.has(surf_idx) and _source_materials_cache[surf_idx]:
 			_runtime_mesh.surface_set_material(surf_idx, _source_materials_cache[surf_idx])
 
-	# --- 5. REATTACH MESH & RESTORE OVERRIDES ---
-	# Now that the mesh is valid and has surfaces, we assign it back.
+	# 4. Reattach
 	parent.mesh = _runtime_mesh
 	
 	for idx in instance_overrides:
-		# Safety check: Ensure the new mesh actually has this surface index
 		if idx < parent.get_surface_override_material_count():
 			parent.set_surface_override_material(idx, instance_overrides[idx])
 
 # --- UNDO / REDO API ---
 
 func get_data_snapshot() -> Dictionary:
-	var snapshot = {}
-	for surface_idx in surface_data:
-		snapshot[surface_idx] = surface_data[surface_idx].duplicate()
-	return snapshot
+	return surface_data.duplicate(true)
 
 func apply_data_snapshot(snapshot: Dictionary):
 	surface_data = snapshot.duplicate(true)

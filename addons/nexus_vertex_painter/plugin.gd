@@ -43,7 +43,7 @@ func _enter_tree():
 	btn_mode.toggle_mode = true
 	btn_mode.toggled.connect(_on_mode_toggled)
 	
-	# Setup File Dialog
+	# Setup File Dialog for Baking
 	file_dialog = EditorFileDialog.new()
 	file_dialog.file_mode = EditorFileDialog.FILE_MODE_SAVE_FILE
 	file_dialog.access = EditorFileDialog.ACCESS_RESOURCES
@@ -58,7 +58,12 @@ func _enter_tree():
 	add_control_to_container(CONTAINER_SPATIAL_EDITOR_MENU, btn_mode)
 	
 	_init_shared_brush_material()
-	get_editor_interface().get_selection().selection_changed.connect(_on_selection_changed)
+	
+	# --- SIGNAL FIX (Guard Clause) ---
+	# Prevents "Signal already connected" error on plugin reload
+	var selection = get_editor_interface().get_selection()
+	if not selection.selection_changed.is_connected(_on_selection_changed):
+		selection.selection_changed.connect(_on_selection_changed)
 
 func _exit_tree():
 	if file_dialog:
@@ -217,9 +222,16 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 	
 	# --- 1. KEYBOARD SHORTCUTS ---
 	if event is InputEventKey and event.pressed and not event.echo:
+		# Cycle Mode Forward
 		if event.keycode == KEY_X:
-			dock_instance.toggle_add_subtract()
+			dock_instance.toggle_add_subtract(false)
 			return AFTER_GUI_INPUT_STOP
+		# Cycle Mode Backward (Support Y for QWERTZ and Z for QWERTY)
+		if event.keycode == KEY_Y or event.keycode == KEY_Z:
+			dock_instance.toggle_add_subtract(true)
+			return AFTER_GUI_INPUT_STOP
+		
+		# Channel Toggles
 		if event.keycode == KEY_1:
 			dock_instance.toggle_channel_by_index(0)
 			return AFTER_GUI_INPUT_STOP
@@ -233,7 +245,7 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 			dock_instance.toggle_channel_by_index(3)
 			return AFTER_GUI_INPUT_STOP
 	
-	# --- 2. MOUSE SHORTCUTS (Size/Strength/Falloff) ---
+	# --- 2. MOUSE SHORTCUTS (Size/Strength/Falloff/Rotation) ---
 	if event is InputEventMouseButton:
 		if event.button_index == MOUSE_BUTTON_RIGHT:
 			if event.pressed:
@@ -244,7 +256,7 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 					return AFTER_GUI_INPUT_STOP
 				elif event.shift_pressed:
 					is_adjusting_brush = true
-					adjust_mode = 2 # Falloff
+					adjust_mode = 2 # Falloff & Rotation
 					return AFTER_GUI_INPUT_STOP
 			else:
 				# Stop Adjusting (Release RMB)
@@ -261,9 +273,10 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 		var speed_size = 0.01
 		var speed_strength = 0.005
 		var speed_falloff = 0.005
+		var speed_rotation = 0.05 # New for Rotation
 		
 		if adjust_mode == 1: # Ctrl + RMB
-			# Vertical = Size (-Y to increase)
+			# Vertical = Size
 			if relative.y != 0:
 				var new_size = settings.size + (-relative.y * speed_size)
 				dock_instance.set_brush_size(clamp(new_size, 0.01, 10.0))
@@ -278,12 +291,17 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 			if relative.y != 0:
 				var new_fall = settings.falloff + (-relative.y * speed_falloff)
 				dock_instance.set_brush_falloff(clamp(new_fall, 0.0, 1.0))
+			
+			# Horizontal = Rotation (NEW)
+			if relative.x != 0:
+				dock_instance.rotate_brush(relative.x * speed_rotation)
 		
 		# Force visual update immediately on the shared material
 		var new_settings = dock_instance.get_settings()
 		shared_brush_material.set_shader_parameter("brush_radius", new_settings.size)
 		shared_brush_material.set_shader_parameter("falloff_range", new_settings.falloff)
 		shared_brush_material.set_shader_parameter("brush_strength", new_settings.strength)
+		shared_brush_material.set_shader_parameter("brush_angle", new_settings.brush_angle) # NEW
 		
 		return AFTER_GUI_INPUT_STOP
 
@@ -315,7 +333,6 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 		hit_something = true
 		var collider = result.collider
 		
-		# Identify which mesh was hit
 		if collider in temp_colliders:
 			hit_mesh_instance = collider.get_parent()
 		else:
@@ -337,12 +354,11 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 			shared_brush_material.set_shader_parameter("falloff_range", settings.falloff)
 			shared_brush_material.set_shader_parameter("channel_mask", settings.channels)
 			shared_brush_material.set_shader_parameter("brush_strength", settings.strength)
+			shared_brush_material.set_shader_parameter("brush_angle", settings.brush_angle) # NEW
 			
-			# NEW: Pass the hit normal for correct texture orientation
 			if result.has("normal"):
 				shared_brush_material.set_shader_parameter("brush_normal", result.normal)
 			
-			# Texture Parameters
 			if settings.brush_texture:
 				shared_brush_material.set_shader_parameter("use_texture", true)
 				shared_brush_material.set_shader_parameter("brush_texture", settings.brush_texture)
@@ -375,7 +391,7 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 	else:
 		if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
 			is_painting = false
-			return AFTER_GUI_INPUT_STOP 
+			return AFTER_GUI_INPUT_STOP
 		
 		if is_painting and event is InputEventMouseMotion:
 			return AFTER_GUI_INPUT_STOP
@@ -419,35 +435,62 @@ func paint_mesh(mesh_instance: MeshInstance3D, global_hit_pos: Vector3, settings
 	if not mesh_instance.mesh: return
 	
 	var data_node = _get_or_create_data_node(mesh_instance)
-	var mesh = mesh_instance.mesh as ArrayMesh
 	
+	# Ensure Cache is ready
+	if data_node._cache_positions.is_empty():
+		data_node._prep_cache(mesh_instance.mesh)
+		
 	var local_hit_pos = mesh_instance.to_local(global_hit_pos)
 	var radius_sq = settings.size * settings.size
+	var brush_size = settings.size
 	
-	# --- TEXTURE PREP ---
+	# --- RESOURCE PREP ---
+	
+	# Texture
 	var brush_image: Image = null
 	if settings.get("brush_texture"):
-		brush_image = settings.brush_texture.get_image()
-		if brush_image and brush_image.is_compressed():
-			brush_image.decompress()
+		var tex = settings.brush_texture
+		if tex:
+			brush_image = tex.get_image()
+			if brush_image:
+				# FIX: Decompress is not enough. We must force a CPU-readable format (RGBA8).
+				if brush_image.is_compressed():
+					brush_image.decompress()
+				
+				# Explicitly convert to RGBA8 to ensure get_pixel() never fails
+				if brush_image.get_format() != Image.FORMAT_RGBA8:
+					brush_image.convert(Image.FORMAT_RGBA8)
 	
-	# --- MASKING PREP ---
+	# Slope Mask
 	var use_slope_mask = settings.get("mask_slope_enabled", false)
 	var slope_angle_cos = 0.0
 	var slope_invert = settings.get("mask_slope_invert", false)
-	
 	if use_slope_mask:
 		var angle_deg = settings.get("mask_slope_angle", 45.0)
 		slope_angle_cos = cos(deg_to_rad(angle_deg))
+		
+	# Curvature Mask (NEW)
+	var use_curv_mask = settings.get("mask_curv_enabled", false)
+	var curv_sensitivity = settings.get("mask_curv_sensitivity", 0.5)
+	var curv_invert = settings.get("mask_curv_invert", false)
 	
-	# Iterate over ALL surfaces
-	for surf_idx in range(mesh.get_surface_count()):
-		var mdt = MeshDataTool.new()
-		if mdt.create_from_surface(mesh, surf_idx) != OK: continue
+	# Transform
+	var world_basis = mesh_instance.global_transform.basis
+	
+	# --- ITERATE SURFACES (via Cache) ---
+	
+	for surf_idx in data_node._cache_positions.keys():
 		
-		var vertex_count = mdt.get_vertex_count()
+		# FORCE NEIGHBOR CACHE for Curvature/Blur/Sharpen
+		if use_curv_mask or settings.mode == 3 or settings.mode == 4:
+			if data_node.get_neighbors(surf_idx, 0).is_empty():
+				data_node._build_neighbor_cache(surf_idx)
 		
-		# Get colors
+		var positions = data_node.get_positions(surf_idx)
+		var normals = data_node.get_normals(surf_idx)
+		var vertex_count = positions.size()
+		
+		# Colors Init
 		var colors: PackedColorArray
 		if data_node.surface_data.has(surf_idx):
 			colors = data_node.surface_data[surf_idx]
@@ -455,94 +498,146 @@ func paint_mesh(mesh_instance: MeshInstance3D, global_hit_pos: Vector3, settings
 			colors = PackedColorArray()
 			colors.resize(vertex_count)
 			colors.fill(Color.BLACK)
-		
-		if colors.size() != vertex_count: colors.resize(vertex_count)
-		
-		# For blur, we need a read-copy to avoid directional bias (optional, but cleaner)
-		var colors_read = colors.duplicate() if settings.mode == 3 else []
-		
+			
 		var surface_modified = false
 		
+		# Read-Copy for Blur/Sharpen
+		var colors_read: PackedColorArray
+		if settings.mode == 3 or settings.mode == 4:
+			colors_read = colors.duplicate()
+		
+		# --- VERTEX LOOP ---
 		for i in range(vertex_count):
-			var v_pos = mdt.get_vertex(i)
+			var v_pos = positions[i]
+			
+			# OPTIMIZATION: Manhattan Pre-Check
+			if abs(v_pos.x - local_hit_pos.x) > brush_size: continue
+			if abs(v_pos.y - local_hit_pos.y) > brush_size: continue
+			if abs(v_pos.z - local_hit_pos.z) > brush_size: continue
+			
 			var dist_sq = v_pos.distance_squared_to(local_hit_pos)
 			
 			if dist_sq < radius_sq:
 				
-				# Smart Masking
-				if use_slope_mask:
-					var normal = mdt.get_vertex_normal(i)
-					var world_normal = (mesh_instance.global_transform.basis * normal).normalized()
+				# --- SMART MASK: SLOPE ---
+				if use_slope_mask and normals.size() > i:
+					var normal = normals[i]
+					var world_normal = (world_basis * normal).normalized()
 					var dot = world_normal.dot(Vector3.UP)
 					if slope_invert:
 						if dot > slope_angle_cos: continue
 					else:
 						if dot < slope_angle_cos: continue
 				
+				# --- SMART MASK: CURVATURE (NEW) ---
+				if use_curv_mask and normals.size() > i:
+					var neighbors = data_node.get_neighbors(surf_idx, i)
+					if not neighbors.is_empty():
+						var avg_normal = Vector3.ZERO
+						for n_idx in neighbors:
+							if normals.size() > n_idx:
+								avg_normal += normals[n_idx]
+						avg_normal = (avg_normal / neighbors.size()).normalized()
+						
+						var my_normal = normals[i]
+						var flatness = my_normal.dot(avg_normal)
+						
+						# Mapping sensitivity to dot threshold
+						var threshold = 1.0 - (curv_sensitivity * 0.2) # Scaling for better UX
+						
+						if curv_invert: # Paint Flat
+							if flatness < threshold: continue
+						else: # Paint Edges/Curved
+							if flatness > threshold: continue
+				
+				
 				var color = colors[i]
 				var dist = sqrt(dist_sq)
 				var weight = 0.0
 				
-				# Texture Logic
+				# Texture vs Falloff
 				if brush_image:
-					var normal = mdt.get_vertex_normal(i)
+					# Triplanar Mapping (Note: Rotation logic would go here if physically painting rotation)
+					# For now we use standard projection to keep performance high
+					var normal = Vector3.UP
+					if normals.size() > i: normal = normals[i]
 					var world_pos = mesh_instance.to_global(v_pos)
-					var world_normal = (mesh_instance.global_transform.basis * normal).normalized()
+					var world_normal = (world_basis * normal).normalized()
+					
 					var tex_val = _get_triplanar_sample(global_hit_pos, world_pos, world_normal, settings.size, brush_image)
 					var edge_softness = 0.05
-					var circle_mask = 1.0 - smoothstep(settings.size - edge_softness, settings.size, dist)
-					weight = tex_val * circle_mask
+					var t = clamp((dist - (settings.size - edge_softness)) / edge_softness, 0.0, 1.0)
+					weight = tex_val * (1.0 - t)
 				else:
 					var hard_limit = 1.0 - settings.falloff
-					var actual_falloff = 1.0
 					if dist / settings.size > hard_limit:
-						actual_falloff = 1.0 - ((dist / settings.size) - hard_limit) / (1.0 - hard_limit)
-					weight = actual_falloff
+						var t = ((dist / settings.size) - hard_limit) / (1.0 - hard_limit)
+						weight = 1.0 - t
+					else:
+						weight = 1.0
 				
 				# --- BLEND MODES ---
 				
 				if settings.mode == 3: # BLUR
-					# Calculate Average of Neighbors
-					var neighbor_avg = color # Start with self
-					var neighbor_count = 1.0
+					var neighbors = data_node.get_neighbors(surf_idx, i)
+					if neighbors.is_empty(): continue
 					
-					var edges = mdt.get_vertex_edges(i)
-					for edge_idx in edges:
-						var v1 = mdt.get_edge_vertex(edge_idx, 0)
-						var v2 = mdt.get_edge_vertex(edge_idx, 1)
-						var neighbor_id = v2 if v1 == i else v1
-						
-						# Read from copy (colors_read) for stability
-						var neighbor_color = colors_read[neighbor_id]
-						
-						if settings.channels.x > 0: neighbor_avg.r += neighbor_color.r
-						if settings.channels.y > 0: neighbor_avg.g += neighbor_color.g
-						if settings.channels.z > 0: neighbor_avg.b += neighbor_color.b
-						if settings.channels.w > 0: neighbor_avg.a += neighbor_color.a
-						neighbor_count += 1.0
+					var neighbor_avg = Vector4(0,0,0,0)
+					var count = 0.0
+					for n_idx in neighbors:
+						var nc = colors_read[n_idx]
+						if settings.channels.x > 0: neighbor_avg.x += nc.r
+						else: neighbor_avg.x += color.r
+						if settings.channels.y > 0: neighbor_avg.y += nc.g
+						else: neighbor_avg.y += color.g
+						if settings.channels.z > 0: neighbor_avg.z += nc.b
+						else: neighbor_avg.z += color.b
+						if settings.channels.w > 0: neighbor_avg.w += nc.a
+						else: neighbor_avg.w += color.a
+						count += 1.0
+					neighbor_avg /= count
 					
-					neighbor_avg /= neighbor_count
+					var blur_str = settings.strength * weight * 0.5
+					if settings.channels.x > 0: color.r = lerp(color.r, neighbor_avg.x, blur_str)
+					if settings.channels.y > 0: color.g = lerp(color.g, neighbor_avg.y, blur_str)
+					if settings.channels.z > 0: color.b = lerp(color.b, neighbor_avg.z, blur_str)
+					if settings.channels.w > 0: color.a = lerp(color.a, neighbor_avg.w, blur_str)
+
+				elif settings.mode == 4: # SHARPEN (NEW)
+					var neighbors = data_node.get_neighbors(surf_idx, i)
+					if neighbors.is_empty(): continue
 					
-					# Blend towards average
-					var blur_strength = settings.strength * weight * 0.5 # 0.5 to keep it controllable
+					var neighbor_avg = Vector4(0,0,0,0)
+					var count = 0.0
+					for n_idx in neighbors:
+						var nc = colors_read[n_idx]
+						if settings.channels.x > 0: neighbor_avg.x += nc.r
+						else: neighbor_avg.x += color.r
+						if settings.channels.y > 0: neighbor_avg.y += nc.g
+						else: neighbor_avg.y += color.g
+						if settings.channels.z > 0: neighbor_avg.z += nc.b
+						else: neighbor_avg.z += color.b
+						if settings.channels.w > 0: neighbor_avg.w += nc.a
+						else: neighbor_avg.w += color.a
+						count += 1.0
+					neighbor_avg /= count
 					
-					if settings.channels.x > 0: color.r = lerp(color.r, neighbor_avg.r, blur_strength)
-					if settings.channels.y > 0: color.g = lerp(color.g, neighbor_avg.g, blur_strength)
-					if settings.channels.z > 0: color.b = lerp(color.b, neighbor_avg.b, blur_strength)
-					if settings.channels.w > 0: color.a = lerp(color.a, neighbor_avg.a, blur_strength)
+					var sharp_str = settings.strength * weight * 0.5
+					if settings.channels.x > 0: color.r = clamp(color.r + (color.r - neighbor_avg.x) * sharp_str, 0.0, 1.0)
+					if settings.channels.y > 0: color.g = clamp(color.g + (color.g - neighbor_avg.y) * sharp_str, 0.0, 1.0)
+					if settings.channels.z > 0: color.b = clamp(color.b + (color.b - neighbor_avg.z) * sharp_str, 0.0, 1.0)
+					if settings.channels.w > 0: color.a = clamp(color.a + (color.a - neighbor_avg.w) * sharp_str, 0.0, 1.0)
 
 				elif settings.mode == 2: # SET
 					var target_val = settings.strength
-					var alpha = weight 
-					if settings.channels.x > 0: color.r = lerp(color.r, target_val, alpha)
-					if settings.channels.y > 0: color.g = lerp(color.g, target_val, alpha)
-					if settings.channels.z > 0: color.b = lerp(color.b, target_val, alpha)
-					if settings.channels.w > 0: color.a = lerp(color.a, target_val, alpha)
+					if settings.channels.x > 0: color.r = lerp(color.r, target_val, weight)
+					if settings.channels.y > 0: color.g = lerp(color.g, target_val, weight)
+					if settings.channels.z > 0: color.b = lerp(color.b, target_val, weight)
+					if settings.channels.w > 0: color.a = lerp(color.a, target_val, weight)
 					
 				else: # ADD/SUB
 					var strength = settings.strength * weight
 					var blend_op = 1.0 if settings.mode == 0 else -1.0
-					
 					if settings.channels.x > 0: color.r = clamp(color.r + (strength * blend_op), 0.0, 1.0)
 					if settings.channels.y > 0: color.g = clamp(color.g + (strength * blend_op), 0.0, 1.0)
 					if settings.channels.z > 0: color.b = clamp(color.b + (strength * blend_op), 0.0, 1.0)
@@ -782,35 +877,44 @@ func _update_shader_debug_view():
 # --- TEXTURE SAMPLING HELPER ---
 
 func _get_triplanar_sample(brush_pos: Vector3, vert_pos: Vector3, vert_normal: Vector3, radius: float, image: Image) -> float:
-	# 1. Calculate Weights (Sharpened, matching shader)
+	# 1. Calculate Weights
 	var blending = vert_normal.abs()
 	blending = Vector3(pow(blending.x, 4.0), pow(blending.y, 4.0), pow(blending.z, 4.0))
 	var dot_sum = blending.x + blending.y + blending.z
 	if dot_sum > 0.00001:
 		blending /= dot_sum
 	else:
-		blending = Vector3(0, 1, 0) # Fallback
+		blending = Vector3(0, 1, 0) 
 
 	# 2. Relative Position & Scale
 	var rel_pos = vert_pos - brush_pos
 	var uv_scale = 1.0 / (radius * 2.0)
+	var brush_angle_rad = dock_instance.get_settings().brush_angle
 	
-	# 3. Calculate UVs (Matching shader flips exactly)
+	# 3. Calculate UVs (Matching shader flips)
 	
 	# Top/Bottom (XZ Plane)
-	var uv_y = Vector2(rel_pos.x, rel_pos.z) * uv_scale + Vector2(0.5, 0.5)
-	uv_y.y = 1.0 - uv_y.y # Flip Y
-	uv_y.x = 1.0 - uv_y.x # Flip X (Horizontal Mirror Fix)
+	var raw_uv_y = Vector2(rel_pos.x, rel_pos.z)
+	if vert_normal.y < 0.0: raw_uv_y.x = -raw_uv_y.x
+	raw_uv_y.x = -raw_uv_y.x 
+	var uv_y = raw_uv_y * uv_scale + Vector2(0.5, 0.5)
+	uv_y.y = 1.0 - uv_y.y 
+	uv_y = _rotate_uv_cpu(uv_y, brush_angle_rad)
 	
 	# Front/Back (XY Plane)
-	var uv_z = Vector2(rel_pos.x, rel_pos.y) * uv_scale + Vector2(0.5, 0.5)
+	var raw_uv_z = Vector2(rel_pos.x, rel_pos.y)
+	if vert_normal.z < 0.0: raw_uv_z.x = -raw_uv_z.x
+	var uv_z = raw_uv_z * uv_scale + Vector2(0.5, 0.5)
 	uv_z.y = 1.0 - uv_z.y
-	uv_z.x = 1.0 - uv_z.x # Flip X
+	uv_z = _rotate_uv_cpu(uv_z, brush_angle_rad)
 	
 	# Left/Right (ZY Plane)
-	var uv_x = Vector2(rel_pos.z, rel_pos.y) * uv_scale + Vector2(0.5, 0.5)
+	var raw_uv_x = Vector2(rel_pos.z, rel_pos.y)
+	if vert_normal.x < 0.0: raw_uv_x.x = -raw_uv_x.x
+	raw_uv_x.x = -raw_uv_x.x
+	var uv_x = raw_uv_x * uv_scale + Vector2(0.5, 0.5)
 	uv_x.y = 1.0 - uv_x.y
-	uv_x.x = 1.0 - uv_x.x # Flip X
+	uv_x = _rotate_uv_cpu(uv_x, brush_angle_rad)
 
 	# 4. Sample Image
 	var val_x = _sample_image_at_uv(image, uv_x)
@@ -819,6 +923,18 @@ func _get_triplanar_sample(brush_pos: Vector3, vert_pos: Vector3, vert_normal: V
 	
 	# 5. Blend
 	return val_x * blending.x + val_y * blending.y + val_z * blending.z
+
+# Helper needed for rotation
+func _rotate_uv_cpu(uv: Vector2, angle: float) -> Vector2:
+	var pivot = Vector2(0.5, 0.5)
+	var s = sin(angle)
+	var c = cos(angle)
+	var centered = uv - pivot
+	var rotated = Vector2(
+		centered.x * c - centered.y * s,
+		centered.x * s + centered.y * c
+	)
+	return rotated + pivot
 
 func _sample_image_at_uv(image: Image, uv: Vector2) -> float:
 	# Bounds check (Clamp to 0-1)
