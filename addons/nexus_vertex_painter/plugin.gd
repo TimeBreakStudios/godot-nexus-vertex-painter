@@ -23,8 +23,14 @@ var adjust_mode: int = 0 # 0=None, 1=Size/Strength (Ctrl), 2=Falloff (Shift)
 # UNDO / REDO STATE
 var undo_snapshots: Dictionary = {}
 
+# CACHING
+var _cached_brush_image: Image = null
+var _last_brush_texture: Texture2D = null
+
 # Baking
 var file_dialog: EditorFileDialog
+
+
 
 func _enter_tree():
 	dock_instance = DOCK_SCENE.instantiate()
@@ -32,6 +38,7 @@ func _enter_tree():
 	dock_instance.fill_requested.connect(_on_fill_requested)
 	dock_instance.clear_requested.connect(_on_clear_requested)
 	dock_instance.settings_changed.connect(_on_settings_changed)
+	dock_instance.texture_changed.connect(_on_texture_changed)
 	dock_instance.procedural_requested.connect(_on_procedural_requested)
 	dock_instance.bake_requested.connect(_on_bake_requested)
 	dock_instance.revert_requested.connect(_on_revert_requested)
@@ -42,6 +49,8 @@ func _enter_tree():
 	btn_mode.tooltip_text = "Toggle Vertex Paint Mode"
 	btn_mode.toggle_mode = true
 	btn_mode.toggled.connect(_on_mode_toggled)
+	
+	_setup_project_settings()
 	
 	# Setup File Dialog for Baking
 	file_dialog = EditorFileDialog.new()
@@ -60,10 +69,24 @@ func _enter_tree():
 	_init_shared_brush_material()
 	
 	# --- SIGNAL FIX (Guard Clause) ---
-	# Prevents "Signal already connected" error on plugin reload
 	var selection = get_editor_interface().get_selection()
 	if not selection.selection_changed.is_connected(_on_selection_changed):
 		selection.selection_changed.connect(_on_selection_changed)
+
+func _setup_project_settings():
+	# Define the setting path
+	var setting_path = "nexus/vertex_painter/collision_layer"
+	
+	# Set default value if it doesn't exist yet
+	if not ProjectSettings.has_setting(setting_path):
+		ProjectSettings.set_setting(setting_path, 30)
+	ProjectSettings.set_initial_value(setting_path, 30)
+	ProjectSettings.add_property_info({
+		"name": setting_path,
+		"type": TYPE_INT,
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1,32" # Allows selecting Layer 1 to 32
+	})
 
 func _exit_tree():
 	if file_dialog:
@@ -91,6 +114,7 @@ func _on_mode_toggled(pressed: bool):
 		is_adjusting_brush = false
 	else:
 		_refresh_selection_and_colliders()
+		_update_brush_image_cache()
 
 func _handles(object):
 	return object is MeshInstance3D
@@ -167,8 +191,9 @@ func _create_collider_for(mesh_instance: MeshInstance3D):
 	var col = CollisionShape3D.new()
 	col.shape = mesh_instance.mesh.create_trimesh_shape()
 	sb.add_child(col)
-	sb.collision_layer = 1 
+	sb.collision_layer = _get_paint_collision_mask()
 	sb.collision_mask = 0 
+	sb.owner = null
 	
 	mesh_instance.add_child(sb)
 	temp_colliders.append(sb)
@@ -190,9 +215,6 @@ func _clear_all_colliders():
 
 func _get_or_create_data_node(mesh_instance: MeshInstance3D) -> VertexColorData:
 	# --- METADATA PERSISTENCE ---
-	# We store the path of the original mesh (e.g. "res://models/cube.glb") 
-	# in the metadata. We only do this if the key doesn't exist yet, 
-	# to prevent overwriting the original path with a baked mesh path later.
 	if not mesh_instance.has_meta("_vertex_paint_original_path"):
 		if mesh_instance.mesh:
 			var path = mesh_instance.mesh.resource_path
@@ -222,6 +244,8 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 	
 	# --- 1. KEYBOARD SHORTCUTS ---
 	if event is InputEventKey and event.pressed and not event.echo:
+		if event.ctrl_pressed or event.alt_pressed or event.meta_pressed:
+			return AFTER_GUI_INPUT_PASS
 		# Cycle Mode Forward
 		if event.keycode == KEY_X:
 			dock_instance.toggle_add_subtract(false)
@@ -232,18 +256,10 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 			return AFTER_GUI_INPUT_STOP
 		
 		# Channel Toggles
-		if event.keycode == KEY_1:
-			dock_instance.toggle_channel_by_index(0)
-			return AFTER_GUI_INPUT_STOP
-		if event.keycode == KEY_2:
-			dock_instance.toggle_channel_by_index(1)
-			return AFTER_GUI_INPUT_STOP
-		if event.keycode == KEY_3:
-			dock_instance.toggle_channel_by_index(2)
-			return AFTER_GUI_INPUT_STOP
-		if event.keycode == KEY_4:
-			dock_instance.toggle_channel_by_index(3)
-			return AFTER_GUI_INPUT_STOP
+		if event.keycode == KEY_1: dock_instance.toggle_channel_by_index(0); return AFTER_GUI_INPUT_STOP
+		if event.keycode == KEY_2: dock_instance.toggle_channel_by_index(1); return AFTER_GUI_INPUT_STOP
+		if event.keycode == KEY_3: dock_instance.toggle_channel_by_index(2); return AFTER_GUI_INPUT_STOP
+		if event.keycode == KEY_4: dock_instance.toggle_channel_by_index(3); return AFTER_GUI_INPUT_STOP
 	
 	# --- 2. MOUSE SHORTCUTS (Size/Strength/Falloff/Rotation) ---
 	if event is InputEventMouseButton:
@@ -301,7 +317,7 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 		shared_brush_material.set_shader_parameter("brush_radius", new_settings.size)
 		shared_brush_material.set_shader_parameter("falloff_range", new_settings.falloff)
 		shared_brush_material.set_shader_parameter("brush_strength", new_settings.strength)
-		shared_brush_material.set_shader_parameter("brush_angle", new_settings.brush_angle) # NEW
+		shared_brush_material.set_shader_parameter("brush_angle", new_settings.brush_angle)
 		
 		return AFTER_GUI_INPUT_STOP
 
@@ -323,6 +339,7 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 	var space_state = selected_meshes[0].get_world_3d().direct_space_state
 	var query = PhysicsRayQueryParameters3D.create(ray_origin, ray_origin + ray_normal * ray_length)
 	query.collide_with_bodies = true
+	query.collision_mask = _get_paint_collision_mask()
 	
 	var result = space_state.intersect_ray(query)
 	var hit_pos = Vector3.ZERO
@@ -354,7 +371,7 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 			shared_brush_material.set_shader_parameter("falloff_range", settings.falloff)
 			shared_brush_material.set_shader_parameter("channel_mask", settings.channels)
 			shared_brush_material.set_shader_parameter("brush_strength", settings.strength)
-			shared_brush_material.set_shader_parameter("brush_angle", settings.brush_angle) # NEW
+			shared_brush_material.set_shader_parameter("brush_angle", settings.brush_angle)
 			
 			if result.has("normal"):
 				shared_brush_material.set_shader_parameter("brush_normal", result.normal)
@@ -376,12 +393,12 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 		if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
 			if event.pressed:
 				is_painting = true
-				_start_undo_snapshot()
+				_start_undo_cycle() # Prepare for undo
 				paint_mesh(hit_mesh_instance, hit_pos, settings)
 				return AFTER_GUI_INPUT_STOP
 			else:
 				is_painting = false
-				_commit_undo_snapshot()
+				_commit_undo_snapshot() # Commit collected snapshots
 				return AFTER_GUI_INPUT_STOP
 		
 		elif event is InputEventMouseMotion and is_painting:
@@ -400,11 +417,12 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 
 # --- UNDO / REDO IMPLEMENTATION ---
 
-func _start_undo_snapshot():
+func _start_undo_cycle():
 	undo_snapshots.clear()
-	# Save state of ALL selected meshes before painting starts
-	for mesh in selected_meshes:
-		var data_node = _get_or_create_data_node(mesh)
+
+func _ensure_undo_snapshot_for_mesh(data_node: VertexColorData):
+	# Lazy Snapshot: Only store the mesh state if we haven't touched it yet in this stroke.
+	if not undo_snapshots.has(data_node):
 		undo_snapshots[data_node] = data_node.get_data_snapshot()
 
 func _commit_undo_snapshot():
@@ -413,21 +431,52 @@ func _commit_undo_snapshot():
 	var ur = get_undo_redo()
 	ur.create_action("Paint Vertex Colors")
 	
-	for mesh in selected_meshes:
-		var data_node = _get_or_create_data_node(mesh)
+	for data_node in undo_snapshots.keys():
+		var before_state = undo_snapshots[data_node]
+		var after_state = data_node.get_data_snapshot()
 		
-		# If we have a start state for this mesh
-		if undo_snapshots.has(data_node):
-			var before_state = undo_snapshots[data_node]
-			var after_state = data_node.get_data_snapshot()
-			
-			# Undo: Restore old state
-			ur.add_undo_method(data_node, "apply_data_snapshot", before_state)
-			# Do: Restore new state
-			ur.add_do_method(data_node, "apply_data_snapshot", after_state)
+		# Undo: Restore old state
+		ur.add_undo_method(data_node, "apply_data_snapshot", before_state)
+		# Do: Restore new state
+		ur.add_do_method(data_node, "apply_data_snapshot", after_state)
 	
 	ur.commit_action()
 	undo_snapshots.clear()
+
+# --- IMAGE CACHING ---
+
+func _on_texture_changed(tex):
+	_update_brush_image_cache()
+
+func _on_settings_changed():
+	_update_shader_debug_view()
+	# In case texture was changed in settings without drop event
+	_update_brush_image_cache()
+
+func _update_brush_image_cache():
+	var settings = dock_instance.get_settings()
+	var current_tex = settings.get("brush_texture")
+	
+	# Only update if texture actually changed or cache is missing
+	if current_tex == _last_brush_texture and _cached_brush_image != null:
+		if current_tex != null: return
+		
+	_last_brush_texture = current_tex
+	
+	if current_tex:
+		var img = current_tex.get_image()
+		if img:
+			# Decompress and Convert ONCE here, not in the paint loop
+			if img.is_compressed():
+				img.decompress()
+			
+			# Ensure RGBA8 for fast get_pixel
+			if img.get_format() != Image.FORMAT_RGBA8:
+				img.convert(Image.FORMAT_RGBA8)
+				
+			_cached_brush_image = img
+	else:
+		_cached_brush_image = null
 
 # --- PAINTING LOGIC (Multi-Surface) ---
 
@@ -435,6 +484,10 @@ func paint_mesh(mesh_instance: MeshInstance3D, global_hit_pos: Vector3, settings
 	if not mesh_instance.mesh: return
 	
 	var data_node = _get_or_create_data_node(mesh_instance)
+	
+	# UNDO FIX: Lazy snapshot
+	if is_painting:
+		_ensure_undo_snapshot_for_mesh(data_node)
 	
 	# Ensure Cache is ready
 	if data_node._cache_positions.is_empty():
@@ -444,22 +497,9 @@ func paint_mesh(mesh_instance: MeshInstance3D, global_hit_pos: Vector3, settings
 	var radius_sq = settings.size * settings.size
 	var brush_size = settings.size
 	
-	# --- RESOURCE PREP ---
-	
-	# Texture
-	var brush_image: Image = null
-	if settings.get("brush_texture"):
-		var tex = settings.brush_texture
-		if tex:
-			brush_image = tex.get_image()
-			if brush_image:
-				# FIX: Decompress is not enough. We must force a CPU-readable format (RGBA8).
-				if brush_image.is_compressed():
-					brush_image.decompress()
-				
-				# Explicitly convert to RGBA8 to ensure get_pixel() never fails
-				if brush_image.get_format() != Image.FORMAT_RGBA8:
-					brush_image.convert(Image.FORMAT_RGBA8)
+	# --- IMAGE RESOURCE (FIX POINT 3) ---
+	# Use the cached image directly
+	var brush_image = _cached_brush_image
 	
 	# Slope Mask
 	var use_slope_mask = settings.get("mask_slope_enabled", false)
@@ -469,19 +509,18 @@ func paint_mesh(mesh_instance: MeshInstance3D, global_hit_pos: Vector3, settings
 		var angle_deg = settings.get("mask_slope_angle", 45.0)
 		slope_angle_cos = cos(deg_to_rad(angle_deg))
 		
-	# Curvature Mask (NEW)
+	# Curvature Mask
 	var use_curv_mask = settings.get("mask_curv_enabled", false)
 	var curv_sensitivity = settings.get("mask_curv_sensitivity", 0.5)
 	var curv_invert = settings.get("mask_curv_invert", false)
 	
-	# Transform
 	var world_basis = mesh_instance.global_transform.basis
 	
 	# --- ITERATE SURFACES (via Cache) ---
 	
 	for surf_idx in data_node._cache_positions.keys():
 		
-		# FORCE NEIGHBOR CACHE for Curvature/Blur/Sharpen
+		# FORCE NEIGHBOR CACHE
 		if use_curv_mask or settings.mode == 3 or settings.mode == 4:
 			if data_node.get_neighbors(surf_idx, 0).is_empty():
 				data_node._build_neighbor_cache(surf_idx)
@@ -510,7 +549,7 @@ func paint_mesh(mesh_instance: MeshInstance3D, global_hit_pos: Vector3, settings
 		for i in range(vertex_count):
 			var v_pos = positions[i]
 			
-			# OPTIMIZATION: Manhattan Pre-Check
+			# Manhattan Pre-Check
 			if abs(v_pos.x - local_hit_pos.x) > brush_size: continue
 			if abs(v_pos.y - local_hit_pos.y) > brush_size: continue
 			if abs(v_pos.z - local_hit_pos.z) > brush_size: continue
@@ -519,7 +558,7 @@ func paint_mesh(mesh_instance: MeshInstance3D, global_hit_pos: Vector3, settings
 			
 			if dist_sq < radius_sq:
 				
-				# --- SMART MASK: SLOPE ---
+				# --- SMART MASKS ---
 				if use_slope_mask and normals.size() > i:
 					var normal = normals[i]
 					var world_normal = (world_basis * normal).normalized()
@@ -529,7 +568,6 @@ func paint_mesh(mesh_instance: MeshInstance3D, global_hit_pos: Vector3, settings
 					else:
 						if dot < slope_angle_cos: continue
 				
-				# --- SMART MASK: CURVATURE (NEW) ---
 				if use_curv_mask and normals.size() > i:
 					var neighbors = data_node.get_neighbors(surf_idx, i)
 					if not neighbors.is_empty():
@@ -538,18 +576,13 @@ func paint_mesh(mesh_instance: MeshInstance3D, global_hit_pos: Vector3, settings
 							if normals.size() > n_idx:
 								avg_normal += normals[n_idx]
 						avg_normal = (avg_normal / neighbors.size()).normalized()
-						
 						var my_normal = normals[i]
 						var flatness = my_normal.dot(avg_normal)
-						
-						# Mapping sensitivity to dot threshold
-						var threshold = 1.0 - (curv_sensitivity * 0.2) # Scaling for better UX
-						
-						if curv_invert: # Paint Flat
+						var threshold = 1.0 - (curv_sensitivity * 0.2)
+						if curv_invert:
 							if flatness < threshold: continue
-						else: # Paint Edges/Curved
+						else:
 							if flatness > threshold: continue
-				
 				
 				var color = colors[i]
 				var dist = sqrt(dist_sq)
@@ -557,8 +590,7 @@ func paint_mesh(mesh_instance: MeshInstance3D, global_hit_pos: Vector3, settings
 				
 				# Texture vs Falloff
 				if brush_image:
-					# Triplanar Mapping (Note: Rotation logic would go here if physically painting rotation)
-					# For now we use standard projection to keep performance high
+					# Use Cached Image for sampling
 					var normal = Vector3.UP
 					if normals.size() > i: normal = normals[i]
 					var world_pos = mesh_instance.to_global(v_pos)
@@ -577,57 +609,45 @@ func paint_mesh(mesh_instance: MeshInstance3D, global_hit_pos: Vector3, settings
 						weight = 1.0
 				
 				# --- BLEND MODES ---
-				
+				# (Logic omitted for brevity, identical to original but optimized loop)
 				if settings.mode == 3: # BLUR
 					var neighbors = data_node.get_neighbors(surf_idx, i)
 					if neighbors.is_empty(): continue
-					
 					var neighbor_avg = Vector4(0,0,0,0)
 					var count = 0.0
 					for n_idx in neighbors:
 						var nc = colors_read[n_idx]
-						if settings.channels.x > 0: neighbor_avg.x += nc.r
-						else: neighbor_avg.x += color.r
-						if settings.channels.y > 0: neighbor_avg.y += nc.g
-						else: neighbor_avg.y += color.g
-						if settings.channels.z > 0: neighbor_avg.z += nc.b
-						else: neighbor_avg.z += color.b
-						if settings.channels.w > 0: neighbor_avg.w += nc.a
-						else: neighbor_avg.w += color.a
+						neighbor_avg.x += nc.r if settings.channels.x > 0 else color.r
+						neighbor_avg.y += nc.g if settings.channels.y > 0 else color.g
+						neighbor_avg.z += nc.b if settings.channels.z > 0 else color.b
+						neighbor_avg.w += nc.a if settings.channels.w > 0 else color.a
 						count += 1.0
 					neighbor_avg /= count
-					
 					var blur_str = settings.strength * weight * 0.5
 					if settings.channels.x > 0: color.r = lerp(color.r, neighbor_avg.x, blur_str)
 					if settings.channels.y > 0: color.g = lerp(color.g, neighbor_avg.y, blur_str)
 					if settings.channels.z > 0: color.b = lerp(color.b, neighbor_avg.z, blur_str)
 					if settings.channels.w > 0: color.a = lerp(color.a, neighbor_avg.w, blur_str)
-
-				elif settings.mode == 4: # SHARPEN (NEW)
+				
+				elif settings.mode == 4: # SHARPEN
 					var neighbors = data_node.get_neighbors(surf_idx, i)
 					if neighbors.is_empty(): continue
-					
 					var neighbor_avg = Vector4(0,0,0,0)
 					var count = 0.0
 					for n_idx in neighbors:
 						var nc = colors_read[n_idx]
-						if settings.channels.x > 0: neighbor_avg.x += nc.r
-						else: neighbor_avg.x += color.r
-						if settings.channels.y > 0: neighbor_avg.y += nc.g
-						else: neighbor_avg.y += color.g
-						if settings.channels.z > 0: neighbor_avg.z += nc.b
-						else: neighbor_avg.z += color.b
-						if settings.channels.w > 0: neighbor_avg.w += nc.a
-						else: neighbor_avg.w += color.a
+						neighbor_avg.x += nc.r if settings.channels.x > 0 else color.r
+						neighbor_avg.y += nc.g if settings.channels.y > 0 else color.g
+						neighbor_avg.z += nc.b if settings.channels.z > 0 else color.b
+						neighbor_avg.w += nc.a if settings.channels.w > 0 else color.a
 						count += 1.0
 					neighbor_avg /= count
-					
 					var sharp_str = settings.strength * weight * 0.5
 					if settings.channels.x > 0: color.r = clamp(color.r + (color.r - neighbor_avg.x) * sharp_str, 0.0, 1.0)
 					if settings.channels.y > 0: color.g = clamp(color.g + (color.g - neighbor_avg.y) * sharp_str, 0.0, 1.0)
 					if settings.channels.z > 0: color.b = clamp(color.b + (color.b - neighbor_avg.z) * sharp_str, 0.0, 1.0)
 					if settings.channels.w > 0: color.a = clamp(color.a + (color.a - neighbor_avg.w) * sharp_str, 0.0, 1.0)
-
+				
 				elif settings.mode == 2: # SET
 					var target_val = settings.strength
 					if settings.channels.x > 0: color.r = lerp(color.r, target_val, weight)
@@ -675,7 +695,6 @@ func _on_procedural_requested(type: String, settings: Dictionary):
 
 func _apply_procedural_to_mesh(mesh_instance: MeshInstance3D, type: String, settings: Dictionary):
 	if not mesh_instance.mesh: return
-	
 	var data_node = _get_or_create_data_node(mesh_instance)
 	var mesh = mesh_instance.mesh as ArrayMesh
 	if not mesh: return
@@ -825,7 +844,6 @@ func _apply_global_color(mesh_instance: MeshInstance3D, channels: Vector4, value
 	for surf_idx in range(mesh.get_surface_count()):
 		var arrays = mesh.surface_get_arrays(surf_idx)
 		var vertex_count = arrays[Mesh.ARRAY_VERTEX].size()
-		
 		var colors: PackedColorArray
 		if data_node.surface_data.has(surf_idx):
 			colors = data_node.surface_data[surf_idx]
@@ -865,14 +883,21 @@ func _init_shared_brush_material():
 	shared_brush_material.set_shader_parameter("color", Color(1.0, 0.5, 0.0, 0.8))
 	shared_brush_material.render_priority = 100 
 
-func _on_settings_changed():
-	_update_shader_debug_view()
-
 func _update_shader_debug_view():
 	for mesh in selected_meshes:
 		var mat = mesh.get_active_material(0) as ShaderMaterial
 		if mat:
 			mat.set_shader_parameter("active_layer_view", 0)
+
+func _get_paint_collision_mask() -> int:
+	# Retrieve setting (default to 30 if missing)
+	var layer_idx = ProjectSettings.get_setting("nexus/vertex_painter/collision_layer", 30)
+	
+	# Clamp for safety (Layers are 1-32)
+	layer_idx = clamp(layer_idx, 1, 32)
+	
+	# Bitshift: Layer 1 is 1<<0, Layer 30 is 1<<29
+	return 1 << (layer_idx - 1)
 
 # --- TEXTURE SAMPLING HELPER ---
 
