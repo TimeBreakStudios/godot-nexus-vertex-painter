@@ -106,6 +106,8 @@ func _ready() -> void:
         btn_blur.pressed.connect(_on_mode_blur_pressed)
     if not btn_sharpen.pressed.is_connected(_on_mode_sharpen_pressed):
         btn_sharpen.pressed.connect(_on_mode_sharpen_pressed)
+    if not btn_clear_and_set.pressed.is_connected(_on_mode_clear_and_set_pressed):
+        btn_clear_and_set.pressed.connect(_on_mode_clear_and_set_pressed)
 
     # 4. Setup Action Buttons
     if not btn_fill.pressed.is_connected(_on_fill_pressed):
@@ -170,7 +172,6 @@ func get_settings() -> Dictionary:
         "strength": strength_slider.value,
         "falloff": falloff_slider.value,
         "channels": get_active_channels(),
-        "zero_unselected_channels": zero_unselected_channels_check.button_pressed,
         "mode": _brush_mode,
         "brush_texture": texture_drop.current_texture,
         "brush_angle": brush_angle,
@@ -265,6 +266,7 @@ func _update_all_button_visuals():
     _apply_active_style(btn_set, bg_accent, accent)
     _apply_active_style(btn_blur, bg_accent, accent)
     _apply_active_style(btn_sharpen, bg_accent, accent)
+    _apply_active_style(btn_clear_and_set, bg_accent, accent)
 
 func _apply_active_style(btn: Button, bg_color: Color, border_color: Color):
     if btn.button_pressed:
@@ -369,6 +371,7 @@ func _reset_mode_toggles():
     btn_set.button_pressed = false
     btn_blur.button_pressed = false
     btn_sharpen.button_pressed = false
+    btn_clear_and_set.button_pressed = false
 
 func _on_fill_pressed() -> void: emit_signal("fill_requested", get_active_channels(), 1.0)
 func _on_clear_pressed() -> void: emit_signal("clear_requested", get_active_channels())
