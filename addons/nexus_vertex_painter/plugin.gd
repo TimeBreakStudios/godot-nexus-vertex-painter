@@ -666,7 +666,14 @@ func paint_mesh(mesh_instances: Array[MeshInstance3D], global_hit_pos: Vector3, 
                         if settings.channels.y > 0: color.g = lerp(color.g, target_val, weight)
                         if settings.channels.z > 0: color.b = lerp(color.b, target_val, weight)
                         if settings.channels.w > 0: color.a = lerp(color.a, target_val, weight)
-                        
+
+                    elif settings.mode == 5: # CLEAR & SET:
+                        var target_val = settings.strength
+                        if settings.channels.x > 0: color.r = lerp(color.r, target_val, weight) else: color.r = 0.0
+                        if settings.channels.y > 0: color.g = lerp(color.g, target_val, weight) else: color.g = 0.0
+                        if settings.channels.z > 0: color.b = lerp(color.b, target_val, weight) else: color.b = 0.0
+                        if settings.channels.w > 0: color.a = lerp(color.a, target_val, weight) else: color.a = 0.0
+
                     else: # ADD/SUB
                         var strength = settings.strength * weight
                         var blend_op = 1.0 if settings.mode == 0 else -1.0

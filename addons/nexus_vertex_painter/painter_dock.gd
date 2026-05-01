@@ -47,6 +47,7 @@ signal revert_requested()
 @onready var btn_set: Button = %Set_Button
 @onready var btn_blur: Button = %Blur_Button
 @onready var btn_sharpen: Button = %Sharpen_Button
+@onready var btn_clear_and_set: Button = %ClearAndSet_Button
 @onready var btn_fill: Button = %Fill_Button
 @onready var btn_clear: Button = %Clear_Button
 
@@ -61,7 +62,7 @@ signal revert_requested()
 @onready var btn_revert: Button = %Revert_Button
 
 # Internal State
-# 0 = Add, 1 = Subtract, 2 = Set, 3 = Blur, 4 = Sharpen
+# 0 = Add, 1 = Subtract, 2 = Set, 3 = Blur, 4 = Sharpen, 5 = Clear & Set
 var _brush_mode: int = 0
 var brush_angle: float = 0.0
 
@@ -71,30 +72,30 @@ func _ready() -> void:
     _setup_slider_link(size_slider, size_edit, 1.0)
     _setup_slider_link(falloff_slider, falloff_edit, 0.5)
     _setup_slider_link(strength_slider, strength_edit, 0.25)
-    
+
     # Slope setup
     _setup_slider_link(mask_slope_slider, mask_slope_value, 45.0)
-    
+
     # Curvature setup
     _setup_slider_link(mask_curv_slider, mask_curv_value, 0.5)
-    
+
     # 2. Setup Channels
     for btn in [btn_r, btn_g, btn_b, btn_a]:
         btn.toggle_mode = true
         if not btn.toggled.is_connected(_on_settings_changed_arg):
             btn.toggled.connect(_on_settings_changed_arg)
-    
+
     btn_r.button_pressed = true
-    
+
     # 3. Setup Paint Modes
     btn_add.toggle_mode = true
     btn_sub.toggle_mode = true
     btn_set.toggle_mode = true
     btn_blur.toggle_mode = true
-    btn_sharpen.toggle_mode = true # NEW
-    
+    btn_sharpen.toggle_mode = true
+
     btn_add.button_pressed = true
-    
+
     if not btn_add.pressed.is_connected(_on_mode_add_pressed):
         btn_add.pressed.connect(_on_mode_add_pressed)
     if not btn_sub.pressed.is_connected(_on_mode_sub_pressed):
@@ -105,7 +106,7 @@ func _ready() -> void:
         btn_blur.pressed.connect(_on_mode_blur_pressed)
     if not btn_sharpen.pressed.is_connected(_on_mode_sharpen_pressed):
         btn_sharpen.pressed.connect(_on_mode_sharpen_pressed)
-    
+
     # 4. Setup Action Buttons
     if not btn_fill.pressed.is_connected(_on_fill_pressed):
         btn_fill.pressed.connect(_on_fill_pressed)
@@ -121,32 +122,32 @@ func _ready() -> void:
         btn_proc_slope.pressed.connect(_on_proc_slope_pressed)
     if not btn_proc_noise.pressed.is_connected(_on_proc_noise_pressed):
         btn_proc_noise.pressed.connect(_on_proc_noise_pressed)
-    
+
     # 6. Connect Texture Drop
     if not texture_drop.texture_changed.is_connected(_on_texture_changed):
         texture_drop.texture_changed.connect(_on_texture_changed)
-        
+
     # 7. Setup Mask Toggles (Slope)
     if not mask_slope_check.toggled.is_connected(_on_mask_check_toggled):
         mask_slope_check.toggled.connect(_on_mask_check_toggled)
-        
+
     if not mask_slope_invert.toggled.is_connected(_on_settings_changed_arg):
         mask_slope_invert.toggled.connect(_on_settings_changed_arg)
 
     # 8. Setup Mask Toggles (Curvature - NEW)
     if not mask_curv_check.toggled.is_connected(_on_mask_check_toggled):
         mask_curv_check.toggled.connect(_on_mask_check_toggled)
-    
+
     if not mask_curv_invert.toggled.is_connected(_on_settings_changed_arg):
         mask_curv_invert.toggled.connect(_on_settings_changed_arg)
-    
+
     # 9. Setup Bake & Revert
     if not btn_bake.pressed.is_connected(_on_bake_pressed):
         btn_bake.pressed.connect(_on_bake_pressed)
-    
+
     if not btn_revert.pressed.is_connected(_on_revert_pressed):
         btn_revert.pressed.connect(_on_revert_pressed)
-    
+
     _update_all_button_visuals()
     _update_mask_ui_state()
     set_ui_active(false)
@@ -169,15 +170,16 @@ func get_settings() -> Dictionary:
         "strength": strength_slider.value,
         "falloff": falloff_slider.value,
         "channels": get_active_channels(),
+        "zero_unselected_channels": zero_unselected_channels_check.button_pressed,
         "mode": _brush_mode,
         "brush_texture": texture_drop.current_texture,
         "brush_angle": brush_angle,
-        
+
         # Slope Mask
         "mask_slope_enabled": mask_slope_check.button_pressed,
         "mask_slope_angle": mask_slope_slider.value,
         "mask_slope_invert": mask_slope_invert.button_pressed,
-        
+
         # Curvature Mask
         "mask_curv_enabled": mask_curv_check.button_pressed,
         "mask_curv_sensitivity": mask_curv_slider.value,
@@ -212,7 +214,7 @@ func _setup_slider_link(slider: Slider, edit: LineEdit, default_val: float) -> v
         # Initial Text Set
         if slider.step >= 1.0: edit.text = str(int(default_val))
         else: edit.text = str(default_val)
-        
+
         # Connect LineEdit Submit -> Slider
         if edit.text_submitted.is_connected(_on_edit_submitted): edit.text_submitted.disconnect(_on_edit_submitted)
         edit.text_submitted.connect(func(text):
@@ -253,11 +255,11 @@ func _update_all_button_visuals():
     _apply_active_style(btn_g, Color(0.2, 0.8, 0.2, 0.4), Color(0.4, 1.0, 0.4))
     _apply_active_style(btn_b, Color(0.2, 0.2, 0.8, 0.4), Color(0.4, 0.4, 1.0))
     _apply_active_style(btn_a, Color(0.8, 0.8, 0.8, 0.4), Color(1.0, 1.0, 1.0))
-    
+
     var accent = get_theme_color("accent_color", "Editor")
     var bg_accent = accent
     bg_accent.a = 0.4
-    
+
     _apply_active_style(btn_add, bg_accent, accent)
     _apply_active_style(btn_sub, bg_accent, accent)
     _apply_active_style(btn_set, bg_accent, accent)
@@ -305,7 +307,7 @@ func _update_mask_ui_state():
     mask_slope_slider.modulate.a = opacity_slope
     mask_slope_value.modulate.a = opacity_slope
     mask_slope_invert.modulate.a = opacity_slope
-    
+
     # Curvature UI (NEW)
     var curv_enabled = mask_curv_check.button_pressed
     mask_curv_slider.editable = curv_enabled
@@ -314,7 +316,7 @@ func _update_mask_ui_state():
     var opacity_curv = 1.0 if curv_enabled else 0.5
     mask_curv_label.modulate.a = opacity_curv
     mask_curv_slider.modulate.a = opacity_curv
-    mask_curv_value.modulate.a = opacity_curv 
+    mask_curv_value.modulate.a = opacity_curv
     mask_curv_invert.modulate.a = opacity_curv
 
 # --- BUTTON HANDLERS ---
@@ -354,6 +356,13 @@ func _on_mode_sharpen_pressed() -> void:
     _update_all_button_visuals()
     emit_signal("settings_changed")
 
+func _on_mode_clear_and_set_pressed() -> void:
+    _brush_mode = 5
+    _reset_mode_toggles()
+    btn_clear_and_set.button_pressed = true
+    _update_all_button_visuals()
+    emit_signal("settings_changed")
+
 func _reset_mode_toggles():
     btn_add.button_pressed = false
     btn_sub.button_pressed = false
@@ -379,13 +388,14 @@ func toggle_add_subtract(reverse: bool = false):
     else:
         _brush_mode += 1
         if _brush_mode >= count: _brush_mode = 0
-    
+
     # Trigger Button Logic to update UI and Signals
     if _brush_mode == 0: _on_mode_add_pressed()
     elif _brush_mode == 1: _on_mode_sub_pressed()
     elif _brush_mode == 2: _on_mode_set_pressed()
     elif _brush_mode == 3: _on_mode_blur_pressed()
     elif _brush_mode == 4: _on_mode_sharpen_pressed()
+    elif _brush_mode == 5: _on_mode_clear_and_set_pressed()
 
 func toggle_channel_by_index(index: int):
     var buttons = [btn_r, btn_g, btn_b, btn_a]
